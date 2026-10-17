@@ -1,0 +1,882 @@
+
+================================================================================
+FILE: model.py
+================================================================================
+"""Learned categorical observation / memory, with separately generated rules.
+
+Images never reach the interpreter. Training-only inverse/reconstruction heads
+have no runtime call sites. The state vocabulary is anonymous and learned.
+"""
+from dataclasses import dataclass, asdict
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+@dataclass
+class Config:
+    observations: int = 64
+    memories: int = 32
+    actions: int = 17
+    width: int = 128
+    context: int = 128
+    linear_visual_evidence: bool = False
+
+
+def hard(logits):
+    probabilities = logits.float().softmax(-1)
+    discrete = F.one_hot(probabilities.argmax(-1), probabilities.shape[-1]).float()
+    return discrete + probabilities - probabilities.detach()
+
+
+class FactoredWorld(nn.Module):
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.cfg = cfg or Config()
+        c = self.cfg
+        self.visual = nn.Sequential(nn.LayerNorm(49*128), nn.Linear(49*128,512), nn.SiLU(), nn.Linear(512,c.width))
+        self.observation_definitions = nn.Parameter(torch.randn(c.observations,c.width)*.1)
+        self.memory_definitions = nn.Parameter(torch.randn(c.memories,c.width)*.1)
+        # The recurrent carrier is a categorical ID, never a continuous GRU
+        # hidden vector. Each call decodes that ID, updates it, and quantizes.
+        self.memory = nn.GRUCell(c.observations+c.actions+1+c.width,c.width)
+        # An independently parameterized predictor sees CURRENT premises only.
+        # The perception-side memory encoder instead grounds labels in actual
+        # observed histories and is called at runtime only during rule renewal.
+        self.memory_predictor = nn.GRUCell(c.observations+c.actions+1,c.width)
+        self.frame = nn.Linear(49*128,c.context)
+        self.context_history = nn.GRU(c.context+c.observations+c.actions+1,c.context,batch_first=True)
+        self.task = nn.Embedding(2,c.context)
+        self.abstraction_task = nn.Embedding(2,c.context)
+        nn.init.zeros_(self.abstraction_task.weight)
+        self.definition_generator = nn.Linear(c.context,c.memories*c.width)
+        self.observation_embedding = nn.Linear(c.observations,c.width,bias=False)
+        self.action_embedding = nn.Embedding(c.actions,c.width)
+        self.rule = nn.Sequential(nn.Linear(c.width*3+c.context,256),nn.SiLU(),nn.Linear(256,c.observations))
+        self.memory_rule = nn.Sequential(nn.Linear(c.width*3+c.context,128),nn.SiLU(),nn.Linear(128,c.width))
+        nn.init.zeros_(self.memory_rule[-1].weight);nn.init.zeros_(self.memory_rule[-1].bias)
+        self.goal = nn.Sequential(nn.Linear(c.context,256),nn.SiLU(),nn.Linear(256,c.memories+c.observations))
+        self.renewal = nn.Sequential(nn.Linear(c.memories+c.observations*2+1,128),nn.SiLU(),nn.Linear(128,1))
+        # Auxiliary heads train abstractions, never select runtime actions.
+        # Observation codes ONLY. A future memory code contains action history
+        # and would leak the answer into inverse prediction.
+        self.inverse = nn.Sequential(nn.Linear(2*c.observations+10,256),nn.SiLU(),nn.Linear(256,c.actions))
+        self.reconstruct = nn.Linear(c.observations,49*128)
+        self.memory_reconstruct = nn.Linear(c.memories,c.width)
+        # Training-only joint reconstruction grounds anonymous codes in images.
+        self.state_reconstruct = nn.Sequential(nn.Linear(c.memories+c.observations,256),
+            nn.SiLU(),nn.Linear(256,49*128))
+        # Generic learned persistence, identical mechanism for ALL action IDs.
+        # No action is assigned a hand-coded identity/STOP/collision effect.
+        self.persistence = nn.Sequential(nn.Linear(c.width*3+c.context,64),nn.SiLU(),nn.Linear(64,1))
+        self.action_persistence = nn.Embedding(c.actions,1)
+        nn.init.zeros_(self.persistence[-1].weight);nn.init.zeros_(self.persistence[-1].bias)
+        nn.init.constant_(self.action_persistence.weight,-3.)
+        # A learned operator class shared across ALL possible source IDs.
+        # Supervision comes from observed action effects, never action names.
+        # Class 0 permits change, class 1 preserves the observed code.
+        self.operator_class=nn.Embedding(c.actions,2)
+        nn.init.zeros_(self.operator_class.weight)
+        # Forward values remain identical. Copy evidence is a categorical
+        # premise, not a differentiable way to rename the current state to
+        # match an unlikely successor. The recurrent categorical carrier also
+        # bounds credit assignment; local transition/perception losses remain.
+        # Entire 64x128 observation-definition vectors are generated at the
+        # rule boundary. They are fixed for the lifetime of that program.
+        self.observation_definition_generator=nn.Linear(c.context,c.observations*c.width)
+        nn.init.zeros_(self.observation_definition_generator.weight)
+        nn.init.zeros_(self.observation_definition_generator.bias)
+        self.definition_feature_decoder=nn.Linear(c.width,49*128,bias=False)
+        nn.init.normal_(self.definition_feature_decoder.weight,std=.01)
+        # Training-only discriminator on hard symbolic premises. It never
+        # receives images/context/action IDs and is forbidden at runtime.
+        self.temporal_contrast=nn.Sequential(nn.Linear(c.memories+2*c.observations,128),
+            nn.Tanh(),nn.Linear(128,1))
+        self.detach_copy_evidence=True
+        self.detach_memory_carrier=True
+        if c.linear_visual_evidence:
+            # Generic image-to-definition compatibility, shared by all IDs.
+            # No goal, STOP label, semantic class, or motor action enters here.
+            self.linear_visual_evidence=nn.Linear(49*128,c.width,bias=False)
+            nn.init.zeros_(self.linear_visual_evidence.weight)
+            self.register_buffer('evidence_mean',torch.zeros(49*128))
+            self.register_buffer('evidence_scale',torch.ones(49*128))
+
+    def load_v54(self,state):
+        missing,unexpected=self.load_state_dict(state,strict=False)
+        assert not unexpected and set(missing)=={
+            'temporal_contrast.0.weight','temporal_contrast.0.bias',
+            'temporal_contrast.2.weight','temporal_contrast.2.bias'}, (missing,unexpected)
+
+    def load_v48(self, state):
+        missing,unexpected=self.load_state_dict(state,strict=False)
+        assert not unexpected and missing==['abstraction_task.weight'], (missing,unexpected)
+        nn.init.zeros_(self.abstraction_task.weight)
+
+    def export_config(self):
+        return asdict(self.cfg)
+
+    def observation_definition_delta(self, context):
+        return self.observation_definition_generator(context).reshape(-1,self.cfg.observations,self.cfg.width)
+
+    def observation_encoding(self, features, context=None):
+        z=F.normalize(self.visual(features.float().flatten(-2)),dim=-1)
+        if context is None:
+            definitions=F.normalize(self.observation_definitions,dim=-1)
+            logits=12*z@definitions.T
+            selected=definitions[logits.detach().argmax(-1)]
+        else:
+            assert len(features)==len(context)
+            definitions=F.normalize(self.observation_definitions[None]+self.observation_definition_delta(context),dim=-1)
+            logits=12*torch.einsum('b...w,bow->b...o',z,definitions)
+            if self.cfg.linear_visual_evidence:
+                x=(features.float().flatten(-2)-self.evidence_mean)/self.evidence_scale
+                extra=self.linear_visual_evidence(x)
+                logits=logits+torch.einsum('b...w,bow->b...o',extra,definitions)
+            discrete=F.one_hot(logits.detach().argmax(-1),self.cfg.observations).float()
+            selected=torch.einsum('b...o,bow->b...w',discrete,definitions)
+        return logits,z,selected
+
+    def observe(self, features, context=None):
+        return self.observation_encoding(features,context)[0]
+
+    def definition_residual(self, observation, context):
+        delta=torch.einsum('b...o,bow->b...w',observation,self.observation_definition_delta(context))
+        return self.definition_feature_decoder(delta)
+
+    def load_v43(self, state):
+        missing,unexpected=self.load_state_dict(state,strict=False)
+        assert not unexpected
+        assert set(missing)=={'observation_definition_generator.weight',
+            'observation_definition_generator.bias','definition_feature_decoder.weight'}
+
+    def memory_step(self, memory, observation, previous, evidence, initial=False):
+        """Perception-side grounding from previous memory and arriving evidence.
+
+        The zero initial carrier is a fixed sequence boundary, not a hidden
+        recurrent history. This encoder supplies labels during training and
+        a grounded initial state at a runtime rule boundary. It is NOT the
+        separately parameterized future-memory predictor used by world rules.
+        """
+        shape=observation.shape[:-1]
+        assert evidence.shape == (*observation.shape[:-1],self.cfg.width)
+        x=torch.cat([observation,F.one_hot(previous,self.cfg.actions+1).float(),evidence],-1)
+        carrier=memory.detach() if memory is not None and self.detach_memory_carrier else memory
+        hidden=(torch.zeros(*shape,self.cfg.width,device=x.device) if initial
+                else self.memory_reconstruct(carrier))
+        state=self.memory(x.reshape(-1,x.shape[-1]),hidden.reshape(-1,self.cfg.width)).reshape(*shape,self.cfg.width)
+        logits=12*F.normalize(state,dim=-1)@F.normalize(self.memory_definitions,dim=-1).T
+        return logits,state
+
+    def memory_sequence(self, observations, previous, evidence, hidden=None):
+        # `hidden`, if supplied for a counterfactual successor, is a hard memory
+        # distribution of width memories, NOT the GRU's continuous activation.
+        carrier=hidden[0] if hidden is not None else None
+        logits=[];states=[]
+        for t in range(observations.shape[1]):
+            # This is a grounded HISTORY ENCODER, not runtime state execution.
+            # Actual O_t may ground M_t during training and at rule boundaries.
+            # Between boundaries, the interpreter uses exported predictions;
+            # it never calls this encoder to replace its ongoing hard memory.
+            source_observation=observations[:,t]
+            lm,state=self.memory_step(carrier,source_observation,previous[:,t],evidence[:,t],initial=carrier is None)
+            logits.append(lm);states.append(state);carrier=hard(lm)
+        return torch.stack(logits,1),torch.stack(states,1),carrier[None]
+
+    def context_sequence(self, features, observations, previous, task):
+        x = torch.cat([self.frame(features.float().flatten(-2)),observations,
+                       F.one_hot(previous,self.cfg.actions+1).float()],-1)
+        # The physical scene does not change with a task. The LEARNED symbolic
+        # basis may focus on different evidence for different tasks. All current
+        # and future labels and every generated rule use this SAME fixed basis.
+        return self.context_history(x.float())[0]+self.abstraction_task(task)[:,None]
+
+    def definitions(self, context):
+        return self.definition_generator(context).reshape(-1,self.cfg.memories,self.cfg.width)
+
+    def transition(self, context, memory, observation, action, definitions=None):
+        """Selected complete categorical row. Inputs are hard one-hot IDs.
+
+        Differentiable one-hot relaxations are used ONLY for backward gradients.
+        Runtime export enumerates every (memory, observation, action) tuple.
+        """
+        definitions = self.definitions(context) if definitions is None else definitions
+        memory_embedding = torch.einsum('b...m,bmw->b...w',memory,definitions)
+        observation_embedding = self.observation_embedding(observation)
+        action_embedding = self.action_embedding(action)
+        c = context.reshape(context.shape[0], *((1,)*(memory.ndim-2)), -1).expand(*memory.shape[:-1],context.shape[-1])
+        inputs=torch.cat([memory_embedding,observation_embedding,action_embedding,c],-1)
+        lo = self.rule(inputs)
+        gates=(self.persistence(inputs)+self.action_persistence(action)).sigmoid()
+        evidence=observation.detach() if getattr(self,'detach_copy_evidence',False) else observation
+        po=gates*evidence+(1-gates)*lo.softmax(-1)
+        # Only the independently measured effect-classification objective
+        # trains this operator class. Planning convenience cannot change it.
+        preserve=hard(self.operator_class(action)).detach()[...,1,None]
+        po=preserve*evidence+(1-preserve)*po
+        log_observation=po.clamp_min(1e-9).log()
+        # Future memory is predicted now from current hard premises. The
+        # separate supervision encoder can see recorded future evidence during
+        # training; this predictor and compiled table cannot see that evidence.
+        carrier=memory.detach() if self.detach_memory_carrier else memory
+        hidden=self.memory_reconstruct(carrier)
+        current_inputs=torch.cat([observation,F.one_hot(action,self.cfg.actions+1).float()],-1)
+        state=self.memory_predictor(current_inputs.reshape(-1,current_inputs.shape[-1]),
+            hidden.reshape(-1,self.cfg.width)).reshape(*memory.shape[:-1],self.cfg.width)
+        state=state+self.memory_rule(inputs)
+        lm=12*F.normalize(state,dim=-1)@F.normalize(self.memory_definitions,dim=-1).T
+        return lm,log_observation
+
+    @torch.no_grad()
+    def initialize_memory_predictor(self):
+        """Initialize added parameters without tying them to the label encoder."""
+        state=dict(self.memory.state_dict())
+        state['weight_ih']=state['weight_ih'][:,:self.cfg.observations+self.cfg.actions+1].clone()
+        self.memory_predictor.load_state_dict(state)
+        self.memory_rule[-1].weight.zero_();self.memory_rule[-1].bias.zero_()
+
+    def initialize_v41(self, state):
+        """Reuse old weights while separating predictor and grounding encoder."""
+        state=dict(state)
+        old=state['memory.weight_ih']
+        weight=self.memory.weight_ih.detach().clone()
+        weight[:,:old.shape[1]]=old
+        weight[:,old.shape[1]:]*=.2
+        state['memory.weight_ih']=weight
+        missing,unexpected=self.load_state_dict(state,strict=False)
+        assert not unexpected
+        assert all(k.startswith(('memory_predictor.','memory_rule.','state_reconstruct.')) for k in missing),missing
+        self.initialize_memory_predictor()
+
+    def goal_logits(self, context, task):
+        return self.goal(context+self.task(task)).split([self.cfg.memories,self.cfg.observations],-1)
+
+    def persistence_logits(self,context,memory,observation,action):
+        definitions=self.definitions(context)
+        memory_embedding=torch.einsum('b...m,bmw->b...w',memory,definitions)
+        c=context.reshape(context.shape[0],*((1,)*(memory.ndim-2)),-1).expand(*memory.shape[:-1],context.shape[-1])
+        inputs=torch.cat([memory_embedding,self.observation_embedding(observation),self.action_embedding(action),c],-1)
+        return self.persistence(inputs)+self.action_persistence(action)
+
+    def renewal_logits(self, memory, observed, predicted_observation, age):
+        return self.renewal(torch.cat([memory,observed,predicted_observation,age[...,None]/32],-1)).squeeze(-1)
+
+    def forward(self, data):
+        # A DDP-visible entry point; all training heads participate in one graph.
+        from objectives import objective
+        return objective(self, data)
+
+    def load_v37(self, state):
+        """Reuse weights; change only the recurrent carrier and table factorization."""
+        state=dict(state)
+        for name in ('weight_ih','weight_hh','bias_ih','bias_hh'):
+            state['memory.'+name]=state.pop('memory.'+name+'_l0')
+        for name in ('weight','bias'):
+            state['rule.2.'+name]=state['rule.2.'+name][self.cfg.memories:]
+            state['persistence.2.'+name]=state['persistence.2.'+name][1:2]
+        state['action_persistence.weight']=state['action_persistence.weight'][:,1:2]
+        self.load_state_dict(state,strict=True)
+
+    @torch.no_grad()
+    def compile(self, context, task):
+        assert context.shape[0] == 1
+        c=self.cfg
+        s,o,a=torch.meshgrid(torch.arange(c.memories,device=context.device),
+            torch.arange(c.observations,device=context.device),torch.arange(c.actions,device=context.device),indexing='ij')
+        s=s.flatten();o=o.flatten();a=a.flatten();definitions=self.definitions(context)
+        memories=[];probabilities=[]
+        for begin in range(0,len(s),4096):
+            sm,ob=self.transition(context,F.one_hot(s[None,begin:begin+4096],c.memories).float(),
+                F.one_hot(o[None,begin:begin+4096],c.observations).float(),a[None,begin:begin+4096],definitions)
+            memories.append(sm.argmax(-1).squeeze(0).cpu())
+            probability=ob.exp()
+            # An empirically learned preserving operator has exact singleton
+            # support. A log floor is numerical protection, not extra outcomes.
+            preserve=self.operator_class(a[None,begin:begin+4096]).argmax(-1)==1
+            probability=torch.where(preserve[...,None],F.one_hot(o[None,begin:begin+4096],c.observations).float(),probability)
+            probability=probability/probability.sum(-1,keepdim=True)
+            probabilities.append(probability.squeeze(0).cpu())
+        goal_m,goal_o=self.goal_logits(context,task)
+        return dict(next_memory=torch.cat(memories).reshape(c.memories*c.observations,c.actions).numpy(),
+                    outcome_probability=torch.cat(probabilities).reshape(c.memories*c.observations,c.actions,c.observations).numpy(),
+                    goal=int(goal_m.argmax(-1))*c.observations+int(goal_o.argmax(-1)))
+
+
+BaseWorld=FactoredWorld
+
+"""Anonymous-code transition decoder that consumes the actual definitions.
+
+This module generates a categorical row from integer premises. It is not a
+planner and never carries a continuous state between simulated actions.
+Renaming observation IDs and their definitions must only rename its output.
+"""
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+class DefinitionRule(nn.Module):
+    def __init__(self, width=128, context=128):
+        super().__init__()
+        self.query = nn.Sequential(nn.Linear(width * 3 + context, 256),
+                                   nn.SiLU(), nn.Linear(256, width))
+        self.persistence = nn.Sequential(nn.Linear(width * 3 + context, 64),
+                                         nn.SiLU(), nn.Linear(64, 1))
+        nn.init.constant_(self.persistence[-1].bias, -3.)
+        self.log_scale = nn.Parameter(torch.tensor(2.48490665))  # log(12)
+
+    def forward(self, memory_definition, observation, definitions,
+                action_embedding, context, preserve):
+        """All premise values are hard IDs; their definitions are fixed rules.
+
+        Shapes: [B,A,W], [B,A,O], [B,O,W], [B,A,W], [B,C], [B,A,1].
+        Returning log categorical probabilities permits exact table export.
+        """
+        evidence = torch.einsum('bao,bow->baw', observation, definitions)
+        ctx = context[:, None].expand(-1, observation.shape[1], -1)
+        inputs = torch.cat([memory_definition, evidence, action_embedding, ctx], -1)
+        query = F.normalize(self.query(inputs), dim=-1)
+        scale = self.log_scale.exp().clamp(1., 32.)
+        logits = scale * torch.einsum('baw,bow->bao', query, definitions)
+        gate = self.persistence(inputs).sigmoid()
+        # A copied premise is an integer fact, not a differentiable shortcut
+        # that can rename the input so a wrong transition appears correct.
+        copied = observation.detach()
+        probabilities = gate * copied + (1-gate) * logits.softmax(-1)
+        probabilities = preserve * copied + (1-preserve) * probabilities
+        return probabilities.clamp_min(1e-9).log()
+
+
+def definition_inputs(model, context, memory, observation, actions):
+    definitions = F.normalize(model.observation_definitions[None] +
+                              model.observation_definition_delta(context), dim=-1)
+    memory_definition = torch.einsum('bam,bmw->baw', memory, model.definitions(context))
+    action_embedding = model.action_embedding(actions)
+    preserve = (model.operator_class(actions).argmax(-1) == 1)[..., None].float()
+    return memory_definition, observation, definitions, action_embedding, context, preserve
+
+
+"""Definition-aware categorical rules; no continuous runtime-state carrier."""
+import torch
+
+
+class FactoredWorld(BaseWorld):
+    def __init__(self,cfg=None):
+        super().__init__(cfg)
+        self.definition_rule=DefinitionRule(self.cfg.width,self.cfg.context)
+        # The old index-specific output decoder is retained only for exact
+        # checkpoint provenance. It is neither optimized nor used for O'.
+        self.rule.requires_grad_(False)
+
+    def load_initial(self,state,head):
+        missing,unexpected=self.load_state_dict(state,strict=False)
+        assert not unexpected
+        expected={k for k in self.state_dict() if k.startswith(('temporal_contrast.','definition_rule.'))}
+        assert set(missing)==expected,(missing,expected)
+        self.definition_rule.load_state_dict(head,strict=True)
+
+    def transition(self,context,memory,observation,action,definitions=None):
+        # M' still comes from current integer premises, independently of
+        # future observations. No actual post-action image is accepted here.
+        next_memory,_=super().transition(context,memory,observation,action,definitions)
+        b=len(context);shape=observation.shape
+        arguments=definition_inputs(self,context,memory.reshape(b,-1,self.cfg.memories),
+            observation.reshape(b,-1,self.cfg.observations),action.reshape(b,-1))
+        logp=self.definition_rule(*arguments).reshape(shape)
+        return next_memory,logp
+
+================================================================================
+FILE: train_joint.py
+================================================================================
+"""Joint evidence/rule fitting on normal near/medium measured trajectories."""
+import argparse,json,os,time,gc
+import torch,torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from model import FactoredWorld,Config
+from data import ROOT,sha
+from joint_data import JointData
+from joint_objective import JointObjective,configure,TRAINABLE
+from accelerated_transition import install
+from autobatch import choose
+from evaluate import atomic,evaluate,summarize
+
+OUT=ROOT/'run_expanded_dynamics_v71'
+def log(name,row):
+    with (OUT/name).open('a') as f:f.write(json.dumps(row)+'\n')
+
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--resume');args=parser.parse_args()
+    rank=int(os.environ['RANK']);local=int(os.environ['LOCAL_RANK'])
+    assert os.environ['CUDA_VISIBLE_DEVICES']=='6,7' and int(os.environ['WORLD_SIZE'])==2
+    torch.cuda.set_device(local);torch.set_num_threads(3);torch.manual_seed(671017)
+    torch.backends.cuda.matmul.allow_tf32=True;torch.backends.cudnn.allow_tf32=True
+    dist.init_process_group('nccl');device=torch.device('cuda',local)
+    old=ROOT/'diverse_history_v70';commit=json.loads((old/'source.COMMITTED.json').read_text());assert sha(old/'source.pt')==commit['sha256']
+    saved=torch.load(old/'source.pt',map_location='cpu',weights_only=False)
+    model=FactoredWorld(Config(**dict(saved['model_config'],linear_visual_evidence=True))).to(device)
+    missing,unexpected=model.load_state_dict(saved['model'],strict=False)
+    expected=set() if saved['model_config'].get('linear_visual_evidence',False) else {'linear_visual_evidence.weight','evidence_mean','evidence_scale'}
+    assert not unexpected and set(missing)==expected
+    install(model);model.eval().requires_grad_(False)
+    data=JointData(model,saved['manifest']['transition_holdout_episodes'],device)
+    # A zero adapter must reproduce the original program's local observations.
+    frames=data.feedback[:512,0];programs=data.feedback[:512,1]
+    with torch.no_grad():
+        observed,base=data.logits(model,frames,programs)
+        if expected:assert torch.equal(observed,base)
+        native=model.observe(data.x[frames],data.context[programs])
+        assert torch.equal(observed.argmax(-1),native.argmax(-1))
+    configure(model);objective=JointObjective(model,data)
+    optimizer=torch.optim.AdamW([
+        dict(params=list(model.linear_visual_evidence.parameters()),lr=1e-4,weight_decay=.1),
+        dict(params=[p for n,p in model.named_parameters() if p.requires_grad and not n.startswith('linear_visual_evidence.')],lr=5e-5,weight_decay=1e-4)])
+    frozen={n:v.detach().cpu().clone() for n,v in model.state_dict().items() if not n.startswith(TRAINABLE) and n not in ('evidence_mean','evidence_scale')}
+    manifest=dict(saved['manifest']);del saved
+    manifest.update(architecture='expanded_dynamics_v71',source_commit=commit,curriculum=data.protocol,data_selection=data.summary,
+        updates=1000,learning_rates=dict(visual_linear=1e-4,rules=5e-5),trainable_prefixes=TRAINABLE,
+        frozen_context_definitions_goal_and_memory_predictor=True,anonymous_goal_ids=True,no_new_action_head=True,no_runtime_feedback=True,
+        training_root_memory='Recorded symbolic rollout memory, matching deployed per-step carrier instead of re-grounding from every image',
+        objective='v68 evidence/dynamics/calibration objective on1200fresh normalnear/medium training-layout episodes; only generic visual residual and observation-transition decoder train',
+        max_actions=32,minimum_actions_between_rule_renewal=5,finalfixed80_used=False,
+        full_original_dev80_replaced_by_user=True,development80_sha256=data.protocol['development_sha256'],
+        eligibility='normal near/medium only,960fitting and240heldout measured episodes; entirely distinct from old200episodes; dev layouts disjoint',
+        checkpoint_selection='Minimum heldout goal NLL + O transition NLL +4*symbolic goal Brier, with no lower goal TPR and at most2points lower one/two-step accuracy',
+        inference='Same float64 discrete-rule Bellman derivation batched on GPU; memory grounded only on rule renewal',gpu_symbolic_planner=True,validation_workers_per_gpu=40,
+        source_reference='https://proceedings.neurips.cc/paper/2020/file/3bb585ea00014b0e3ebe4c6dd165a358-Paper.pdf',
+        reference_scope='Planning-relevant model fitting motivation; exact finite-sequence categorical goal calibration is our adaptation, not a reproduction')
+    if rank==0:atomic(OUT/'manifest.json',manifest);atomic(OUT/'dataset.json',data.summary)
+    rng=torch.Generator(device=device).manual_seed(671017+rank)
+    first=1;best=float('inf');chosen=None;feedback_size=4096;pair_size=512
+    if args.resume:
+        p=OUT/args.resume;c=json.loads(p.with_suffix('.COMMITTED.json').read_text());assert sha(p)==c['sha256']
+        r=torch.load(p,map_location=device,weights_only=False);model.load_state_dict(r['model']);optimizer.load_state_dict(r['optimizer'])
+        first=r['update']+1;best=r['best'];chosen=r['chosen'];feedback_size=r['feedback_size'];pair_size=r['pair_size']
+        rng.set_state(r['rng_states'][rank].cpu());del r
+
+    if first==1:
+        model.train();selected_batch,capacity=choose(model,objective,data,rng)
+        feedback_size=selected_batch['feedback'];pair_size=selected_batch['transitions']
+        if rank==0:atomic(OUT/'capacity.json',capacity)
+
+    wrapper=DDP(objective,device_ids=[local],broadcast_buffers=False)
+
+    @torch.no_grad()
+    def score(update):
+        model.eval();d=data.parts['holdout'];totals=torch.zeros(15,device=device,dtype=torch.float64)
+        for ids in d['feedback'][rank::2].split(2048):
+            _,m=objective.feedback(data.feedback[ids])
+            totals[:8]+=torch.stack([m[k].double() for k in ('positive','negative','tp','fp','positive_nll','negative_nll','anchored','code_preserved')])
+        # Fixed deterministic subset of training-layout holdout transitions, not dev episodes.
+        indices=d['pairs'][::2][rank::2]
+        for ids in indices.split(256):
+            _,m=objective.transitions(data.pairs[ids]);n=float(m['one_count']);n2=float(m['two_count'])
+            totals[8:13]+=torch.tensor([float(m['one_hits']),n,float(m['two_hits']),n2,
+                float(m['first_o_nll'])*n+float(m['open_o_nll'])*n2],device=device,dtype=torch.float64)
+            calibrated,_=objective.calibrated_goal(data.pairs[ids]);totals[13]+=calibrated.double()*n;totals[14]+=n
+        dist.all_reduce(totals);p,n,tp,fp,pl,nl,anchor,preserved,h1,c1,h2,c2,tnll,cb,cn=totals.cpu().tolist()
+        row=dict(update=update,time=time.time(),positive=int(p),negative=int(n),tpr=tp/p,fpr=fp/n,
+            goal_nll=.5*(pl/p+nl/n),negative_code_agreement=preserved/max(1,anchor),
+            one_accuracy=h1/c1,two_accuracy=h2/c2,transition_nll=tnll/(c1+c2),symbolic_goal_brier=cb/cn)
+        row['selection_score']=row['goal_nll']+row['transition_nll']+4*row['symbolic_goal_brier']
+        if rank==0:log('heldout.jsonl',row)
+        model.train();return row
+
+    if first==1:
+        baseline=score(0)
+        if rank==0:atomic(OUT/'baseline_holdout.json',baseline)
+    else:baseline=json.loads((OUT/'baseline_holdout.json').read_text())
+    def save(update):
+        states=[None,None];dist.all_gather_object(states,rng.get_state())
+        if rank==0:
+            p=OUT/f'checkpoint_{update:06d}.pt';tmp=p.with_suffix('.tmp')
+            torch.save(dict(model=model.state_dict(),model_config=model.export_config(),manifest=manifest,update=update,
+                optimizer=optimizer.state_dict(),rng_states=states,best=best,chosen=chosen,feedback_size=feedback_size,pair_size=pair_size),tmp)
+            tmp.replace(p);c=dict(filename=p.name,update=update,sha256=sha(p),time=time.time())
+            atomic(p.with_suffix('.COMMITTED.json'),c);atomic(OUT/'latest.COMMITTED.json',c)
+            if chosen==update:atomic(OUT/'best.COMMITTED.json',c)
+            keep={p.name}
+            if (OUT/'best.COMMITTED.json').exists():keep.add(json.loads((OUT/'best.COMMITTED.json').read_text())['filename'])
+            for q in OUT.glob('checkpoint_*.pt'):
+                if q.name not in keep and q.with_suffix('.COMMITTED.json').exists():q.unlink();q.with_suffix('.COMMITTED.json').unlink()
+    began=time.time()
+    for update in range(first,1001):
+        tick=time.time();model.train();f,p=data.sample(rng,feedback_size,pair_size)
+        optimizer.zero_grad(set_to_none=True);loss,metrics=wrapper(f,p);loss.backward()
+        norm=torch.nn.utils.clip_grad_norm_([q for q in model.parameters() if q.requires_grad],5.)
+        assert torch.isfinite(loss) and torch.isfinite(norm);optimizer.step();torch.cuda.synchronize()
+        row=dict(update=update,time=time.time(),seconds=time.time()-tick,feedback_batch=feedback_size,transition_batch=pair_size,
+            gradient_norm=float(norm),peak_gib=torch.cuda.max_memory_allocated()/2**30,**{k:float(v) for k,v in metrics.items()})
+        log(f'rank{rank}.jsonl',row);atomic(OUT/f'status_rank{rank}.json',dict(state='training',pid=os.getpid(),**row))
+        if False: # Capacity was measured on the complete dataset before training.
+            peak=torch.tensor(row['peak_gib'],device=device);dist.all_reduce(peak,op=dist.ReduceOp.MAX)
+            if peak<7:feedback_size=8192;pair_size=1024
+            if rank==0:atomic(OUT/'capacity.json',dict(measured_peak_gib=float(peak),feedback_batch=feedback_size,transition_batch=pair_size,measured_real_backward=True))
+        if update%100==0:
+            measured=score(update)
+            qualifies=(measured['tpr']>=baseline['tpr'] and measured['fpr']<=max(.02,baseline['fpr']) and
+                measured['one_accuracy']>=baseline['one_accuracy']-.02 and measured['two_accuracy']>=baseline['two_accuracy']-.02 and
+                measured['symbolic_goal_brier']<baseline['symbolic_goal_brier'] and measured['selection_score']<baseline['selection_score'])
+            if qualifies and measured['selection_score']<best:best=measured['selection_score'];chosen=update
+            for n,v in frozen.items():assert torch.equal(v,model.state_dict()[n].detach().cpu()),n
+            save(update);dist.barrier()
+            if rank==0:print(json.dumps(dict(update=update,heldout=measured,qualifies=qualifies,elapsed=time.time()-began)),flush=True)
+    summary=None;selected=None
+    if chosen is not None:
+        selected=json.loads((OUT/'best.COMMITTED.json').read_text());p=OUT/selected['filename'];assert sha(p)==selected['sha256']
+        model.load_state_dict(torch.load(p,map_location=device,weights_only=False)['model']);model.detach_memory_carrier=True;model.eval()
+        del wrapper,objective,optimizer,data,loss,metrics;gc.collect();torch.cuda.empty_cache()
+        folder=OUT/'development_best'
+        if not (folder/'summary.json').exists():
+            atomic(OUT/f'status_rank{rank}.json',dict(state='evaluating_new80',pid=os.getpid(),update=chosen,time=time.time()))
+            rows=evaluate(model,manifest,folder,rank,2,workers=40);all_rows=[None,None];dist.all_gather_object(all_rows,rows)
+            if rank==0:atomic(folder/'summary.json',summarize([r for rows in all_rows for r in rows]))
+        dist.barrier();summary=json.loads((folder/'summary.json').read_text())
+    atomic(OUT/f'status_rank{rank}.json',dict(state='complete',pid=os.getpid(),time=time.time(),updates=1000))
+    if rank==0:atomic(OUT/'result.json',dict(state='complete',updates=1000,time=time.time(),chosen=selected,development=summary,
+        baseline_development=json.loads((ROOT/'run_goal_probability_v68/development_best/summary.json').read_text()),goal_complete=False,finalfixed80_used=False))
+    dist.destroy_process_group()
+if __name__=='__main__':main()
+
+================================================================================
+FILE: base_objective.py
+================================================================================
+"""Visual abstraction and discrete dynamics see the same measured outcomes."""
+import torch
+from torch import nn
+from torch.nn import functional as F
+from model import hard
+
+TRAINABLE=('linear_visual_evidence.','definition_rule.')
+def configure(model):
+    for name,p in model.named_parameters():p.requires_grad_(name.startswith(TRAINABLE))
+    model.detach_memory_carrier=False
+def nll(logp,target):return -logp.gather(-1,target[...,None]).squeeze(-1)
+
+class JointObjective(nn.Module):
+    def __init__(self,model,data):super().__init__();self.model=model;self.data=data
+    def feedback(self,rows):
+        model,d=self.model,self.data;frames,programs=rows.unbind(-1)
+        logits,base=d.logits(model,frames,programs);goal=d.goal[programs];y=d.y[frames]
+        logp=logits.log_softmax(-1).gather(-1,goal[:,None]).squeeze(-1)
+        p=logp.exp().clamp_max(1-1e-6);loss=torch.where(y,-logp,-torch.log1p(-p))
+        anchor=(~y)&(base.argmax(-1)!=goal)
+        kl=F.kl_div(logits.log_softmax(-1),base.softmax(-1),reduction='none').sum(-1)
+        anchor_loss=(kl*anchor).sum()/anchor.sum().clamp_min(1)
+        residual=(logits-base).square().mean();prediction=logits.argmax(-1)==goal
+        return loss.mean()+.25*anchor_loss+.001*residual,dict(feedback_loss=loss.mean(),anchor_kl=anchor_loss,
+            positive=y.sum(),negative=(~y).sum(),tp=(prediction&y).sum(),fp=(prediction&~y).sum(),
+            positive_nll=(-logp*y).sum(),negative_nll=(-torch.log1p(-p)*(~y)).sum(),
+            anchored=anchor.sum(),code_preserved=((logits.argmax(-1)==base.argmax(-1))&anchor).sum())
+
+    def transitions(self,rows):
+        model,d=self.model,self.data
+        programs,t,f0,f1,f2,a1,a2,valid,kind=rows.unbind(-1);b=len(rows);idx=torch.arange(b,device=rows.device)
+        context=d.context[programs]
+        # Only the training label encoder sees these recorded histories/futures.
+        with torch.no_grad():
+            unique,back=torch.unique(programs,return_inverse=True)
+            hist=d.history[unique];lh,_=d.logits(model,hist,unique)
+            ml,_,_=model.memory_sequence(hard(lh),d.previous[unique],d.z[hist])
+            root=hard(ml)[back,t]
+            known=d.runtime_memory[programs,t]
+            root=torch.where((known>=0)[:,None],F.one_hot(known.clamp_min(0),32).float(),root)
+        l0,_=d.logits(model,f0,programs);l1,_=d.logits(model,f1,programs);l2,_=d.logits(model,f2,programs)
+        o0=hard(l0);o1=hard(l1);o2=hard(l2)
+        with torch.no_grad():
+            target_m1,_=model.memory_step(root,o1.detach(),a1,d.z[f1])
+            target_m2,_=model.memory_step(hard(target_m1),o2.detach(),a2,d.z[f2])
+        lm1,lp1=model.transition(context,root,o0,a1)
+        first_o=nll(lp1,o1.detach().argmax(-1));first_m=nll(lm1.log_softmax(-1),target_m1.argmax(-1))
+        lm2,lp2=model.transition(context,hard(lm1),o1,a2)
+        conditional_o=nll(lp2,o2.detach().argmax(-1));conditional_m=nll(lm2.log_softmax(-1),target_m2.argmax(-1))
+        eye=torch.eye(64,device=rows.device)[None].expand(b,-1,-1)
+        lm_open,lp_open=model.transition(context,hard(lm1)[:,None].expand(-1,64,-1),eye,a2[:,None].expand(-1,64))
+        marginal=torch.logsumexp(lp1[:,:,None]+lp_open,dim=1)
+        open_o=nll(marginal,o2.detach().argmax(-1))
+        v=valid.float();second=(.5*(conditional_o+conditional_m)+open_o)*v
+        loss=(first_o+first_m).mean()+second.sum()/v.sum().clamp_min(1)
+        with torch.no_grad():
+            changed=o0.argmax(-1)!=o1.argmax(-1);hit=lp1.argmax(-1)==o1.argmax(-1)
+            metrics=dict(transition_loss=loss,first_o_nll=first_o.mean(),first_m_nll=first_m.mean(),
+                open_o_nll=(open_o*v).sum()/v.sum().clamp_min(1),one_count=b,one_hits=hit.sum(),
+                one_m_hits=(lm1.argmax(-1)==target_m1.argmax(-1)).sum(),changed_count=changed.sum(),changed_hits=(hit&changed).sum(),
+                two_count=v.sum(),two_hits=((marginal.argmax(-1)==o2.argmax(-1))*v).sum())
+        return loss,metrics
+
+    def forward(self,feedback_rows,transition_rows):
+        feedback,fm=self.feedback(feedback_rows);transition,tm=self.transitions(transition_rows)
+        loss=feedback+transition
+        return loss,{k:torch.as_tensor(v,device=loss.device).detach().float() for k,v in dict(fm,**tm,loss=loss).items()}
+
+================================================================================
+FILE: joint_objective.py
+================================================================================
+"""Calibrate fixed action-sequence reachability, using existing discrete rules.
+
+There is no learned reward, value, success, or action head. The probability is
+computed by enumerating every anonymous observation outcome, followed by the
+existing learned STOP transition into the model-generated joint goal. Forward
+memory transitions remain categorical IDs; straight-through gradients are a
+training device only. Outcome labels never enter the predictor or interpreter.
+"""
+import torch
+from torch.nn import functional as F
+from model import hard
+from base_objective import JointObjective as BaseObjective,configure,TRAINABLE
+
+def balanced_brier(p,y,valid=None):
+    y=y.float();valid=torch.ones_like(y) if valid is None else valid.float()
+    positive=valid*y;negative=valid*(1-y)
+    a=((p-y).square()*positive).sum()/positive.sum().clamp_min(1)
+    b=((p-y).square()*negative).sum()/negative.sum().clamp_min(1)
+    return .5*(a+b)
+
+def goal_membership(logits,goals):
+    return hard(logits).gather(-1,goals[...,None]).squeeze(-1)
+
+def exported_probability(model,logp,observed,actions):
+    # Match compile(): a learned preserving operator has exact singleton
+    # support; the training log floor is not a possible extra outcome.
+    preserve=model.operator_class(actions).argmax(-1)==1
+    p=torch.where(preserve[...,None],observed,logp.exp())
+    return p/p.sum(-1,keepdim=True)
+
+def derived_probabilities(model,context,memory,observation,a1,a2,goal_m,goal_o):
+    """Exact first/two-action probabilities under the deployed hard-M table."""
+    b=len(context);device=context.device
+    lm1,lp1=model.transition(context,memory,observation,a1);m1=hard(lm1)
+    og=F.one_hot(goal_o,model.cfg.observations).float()
+    stop1,_=model.transition(context,m1,og,torch.zeros_like(a1))
+    terminal1=torch.where(a1==0,goal_membership(lm1,goal_m),goal_membership(stop1,goal_m))
+    probability_row1=exported_probability(model,lp1,observation,a1)
+    p1_goal=probability_row1.gather(-1,goal_o[:,None]).squeeze(-1)
+    probability1=p1_goal*terminal1
+    size=model.cfg.observations;eye=torch.eye(size,device=device)[None].expand(b,-1,-1)
+    lm2,lp2=model.transition(context,m1[:,None].expand(-1,size,-1),eye,a2[:,None].expand(-1,size))
+    stop2,_=model.transition(context,hard(lm2),og[:,None].expand(-1,size,-1),torch.zeros(b,size,device=device,dtype=torch.long))
+    targets=goal_m[:,None].expand(-1,size)
+    terminal2=torch.where(a2[:,None]==0,goal_membership(lm2,targets),goal_membership(stop2,targets))
+    probability_row2=exported_probability(model,lp2,eye,a2[:,None].expand(-1,size))
+    p2_goal=probability_row2.gather(-1,goal_o[:,None,None].expand(-1,size,1)).squeeze(-1)
+    probability2=(probability_row1*p2_goal*terminal2).sum(-1)
+    return probability1,probability2
+
+class JointObjective(BaseObjective):
+    def calibrated_goal(self,rows):
+        model,d=self.model,self.data
+        programs,t,f0,f1,f2,a1,a2,valid,_=rows.unbind(-1);context=d.context[programs]
+        with torch.no_grad():
+            unique,back=torch.unique(programs,return_inverse=True);hist=d.history[unique]
+            lh,_=d.logits(model,hist,unique)
+            ml,_,_=model.memory_sequence(hard(lh),d.previous[unique],d.z[hist])
+            m0=hard(ml)[back,t]
+            known=d.runtime_memory[programs,t]
+            m0=torch.where((known>=0)[:,None],F.one_hot(known.clamp_min(0),32).float(),m0)
+            gm,go=model.goal_logits(context,d.task[programs]);gm=gm.argmax(-1);go=go.argmax(-1)
+        l0,_=d.logits(model,f0,programs)
+        p1,p2=derived_probabilities(model,context,m0,hard(l0),a1,a2,gm,go)
+        y1=d.y[f1];y2=d.y[f2]
+        first=balanced_brier(p1,y1);second=balanced_brier(p2,y2,valid)
+        loss=first+second
+        positive1=y1.float();negative1=(~y1).float();positive2=y2.float()*valid;negative2=(~y2).float()*valid
+        metrics=dict(calibration_loss=loss,one_brier=first,two_brier=second,
+            one_positive_probability=(p1*positive1).sum()/positive1.sum().clamp_min(1),
+            one_negative_probability=(p1*negative1).sum()/negative1.sum().clamp_min(1),
+            two_positive_probability=(p2*positive2).sum()/positive2.sum().clamp_min(1),
+            two_negative_probability=(p2*negative2).sum()/negative2.sum().clamp_min(1))
+        return loss,metrics
+    def forward(self,feedback_rows,transition_rows):
+        base,metrics=super().forward(feedback_rows,transition_rows)
+        calibrated,more=self.calibrated_goal(transition_rows)
+        total=base+4*calibrated
+        metrics.update({k:v.detach() for k,v in more.items()});metrics['loss']=total.detach()
+        return total,metrics
+
+================================================================================
+FILE: planner.py
+================================================================================
+"""Finite-horizon probabilistic derivation over integer symbolic states.
+
+No torch, images, actor, critic, neural search heuristic, or physical map.
+The table contains all learned observation outcomes, not one modal successor.
+Reachability is computed from that table and the unchanged generated goal.
+"""
+from dataclasses import dataclass, field
+import hashlib
+import numpy as np
+
+
+@dataclass
+class Program:
+    next_memory: np.ndarray
+    outcome_probability: np.ndarray
+    goal: int
+    observations: int = 64
+    _levels: list = field(default_factory=list,repr=False)
+    _policies: list = field(default_factory=list,repr=False)
+    _failures: list = field(default_factory=list,repr=False)
+    _probability: np.ndarray = field(default=None,repr=False)
+    _digest: str = field(default='',repr=False)
+
+    def validate(self):
+        t=self.next_memory;p=self.outcome_probability;n=len(t)
+        assert np.issubdtype(t.dtype,np.integer) and t.ndim==2 and t.shape[1]==17
+        assert t.min()>=0 and t.max()<n//self.observations
+        assert p.shape==(*t.shape,self.observations) and np.isfinite(p).all()
+        assert p.min()>=0 and np.allclose(p.sum(-1),1,atol=2e-6)
+        assert 0<=self.goal<n
+        if self._probability is None:
+            # Preserve original bytes for immutable table provenance. Arithmetic
+            # uses a normalized float64 copy: float32 row mass can exceed one.
+            p64=np.asarray(p,dtype=np.float64)
+            self._probability=p64/p64.sum(-1,keepdims=True)
+        return self
+
+    def digest(self):
+        if not self._digest:
+            self._digest=hashlib.sha256(self.next_memory.tobytes()+self.outcome_probability.tobytes()+str(self.goal).encode()).hexdigest()
+        return self._digest
+
+    def extend(self,horizon):
+        if not self._levels:
+            self.validate()
+            self._levels=[np.zeros(len(self.next_memory),dtype=np.float64)]
+            self._failures=[np.ones(len(self.next_memory),dtype=np.float64)]
+            self._policies=[np.zeros(len(self.next_memory),dtype=np.int16)]
+        goal_m,goal_o=divmod(self.goal,self.observations)
+        p=self._probability
+        stop=np.where(self.next_memory[:,0]==goal_m,p[:,0,goal_o],0.)
+        non_goal=np.arange(self.observations)!=goal_o
+        stop_failure=np.where(self.next_memory[:,0]==goal_m,p[:,0,non_goal].sum(-1),1.)
+        while len(self._levels)<=horizon:
+            previous=self._levels[-1].reshape(-1,self.observations)
+            previous_failure=self._failures[-1].reshape(-1,self.observations)
+            q=(p*previous[self.next_memory]).sum(-1)
+            failure=(p*previous_failure[self.next_memory]).sum(-1)
+            # STOP terminates the physical episode and cannot precede another
+            # action. Its only successful outcome is exactly the given goal.
+            q[:,0]=stop
+            failure[:,0]=stop_failure
+            # Maximizing success and minimizing failure are the SAME Bellman
+            # objective. Track both directly (never subtract from one), using
+            # the smaller quantity for comparisons to retain tiny differences.
+            action=np.where(q.max(-1)<=.5,q.argmax(-1),failure.argmin(-1))
+            self._levels.append(np.clip(q[np.arange(len(q)),action],0.,1.))
+            self._failures.append(np.clip(failure[np.arange(len(q)),action],0.,1.))
+            self._policies.append(action.astype(np.int16))
+
+
+def plan(program,memory,observed,horizon=32):
+    assert 1<=horizon<=32
+    program.extend(horizon)
+    initial=int(memory)*program.observations+int(observed)
+    value=float(program._levels[horizon][initial])
+    result=dict(found=value>0,goal=program.goal,memory=int(memory),observed=int(observed),
+                horizon=horizon,model_goal_probability=value,states=[initial],actions=[],
+                branch_probability=[],program_sha256=program.digest(),
+                model_failure_probability=float(program._failures[horizon][initial]),
+                arithmetic='normalized_float64_dual_success_failure_v50',
+                derivation='Expected goal probability Bellman derivation, with complementary failure calculation for stable action comparison')
+    if not result['found']:return result
+    current=initial
+    # One successful branch is recorded for readable proof inspection, while
+    # the selected action is based on ALL branches (not this witness alone).
+    for remaining in range(horizon,0,-1):
+        action=int(program._policies[remaining][current])
+        nm=int(program.next_memory[current,action]);p=program._probability[current,action]
+        future=nm*program.observations+np.arange(program.observations)
+        if action==0:
+            chosen=program.goal%program.observations
+            assert nm==program.goal//program.observations and p[chosen]>0
+        else:
+            mass=p*program._levels[remaining-1][future]
+            chosen=int(mass.argmax());assert mass[chosen]>0
+        if remaining==horizon:
+            result.update(next_memory=nm,predicted_observation=int(p.argmax()),
+                          root_outcome_probabilities=p.tolist(),
+                          root_continuation_probabilities=(future==program.goal).astype(float).tolist() if action==0
+                          else program._levels[remaining-1][future].tolist(),
+                          root_continuation_failures=(future!=program.goal).astype(float).tolist() if action==0
+                          else program._failures[remaining-1][future].tolist())
+        result['actions'].append(action);result['branch_probability'].append(float(p[chosen]))
+        current=int(future[chosen]);result['states'].append(current)
+        if action==0:break
+    audit(program,result)
+    return result
+
+
+def audit(program,proof):
+    assert proof['found'] and proof['program_sha256']==program.digest()
+    current=proof['memory']*program.observations+proof['observed']
+    assert proof['states'][0]==current and proof['actions'][-1]==0
+    remaining=proof['horizon'];program.extend(remaining)
+    assert np.isclose(proof['model_goal_probability'],program._levels[remaining][current])
+    for i,action in enumerate(proof['actions']):
+        assert action==int(program._policies[remaining][current])
+        successor=proof['states'][i+1];nm,ob=divmod(successor,program.observations)
+        assert nm==int(program.next_memory[current,action])
+        assert program.outcome_probability[current,action,ob]>0
+        if action==0:assert i==len(proof['actions'])-1 and successor==program.goal
+        current=successor;remaining-=1
+    # Verify the executed first action is supported by the entire probability
+    # derivation. A tiny successful witness cannot be reported as certainty.
+    assert np.isclose(np.dot(proof['root_outcome_probabilities'],proof['root_continuation_probabilities']),
+                      proof['model_goal_probability'],rtol=2e-6,atol=1e-12)
+    assert np.isclose(np.dot(proof['root_outcome_probabilities'],proof['root_continuation_failures']),
+                      proof['model_failure_probability'],rtol=2e-12,atol=1e-300)
+    assert np.isclose(proof['model_goal_probability']+proof['model_failure_probability'],1.,atol=1e-12)
+    return True
+
+================================================================================
+FILE: gpu_planner.py
+================================================================================
+"""GPU evaluation of the SAME finite categorical Bellman recurrence.
+
+Only immutable learned transition tables and anonymous goals enter this code.
+No neural actor, heuristic, map, or extra observation is introduced.
+"""
+import time
+import numpy as np
+import torch
+from planner import Program as CPUProgram,plan,audit
+
+@torch.no_grad()
+def extend_batch(programs,horizon,device=None):
+    pending=[p for p in programs if len(p._levels)<=horizon]
+    if not pending:return
+    device=device or torch.device('cuda',torch.cuda.current_device())
+    began=time.perf_counter()
+    for p in pending:p.validate()
+    # All programs in a batch share the same learned state/action cardinalities.
+    probs=torch.as_tensor(np.stack([p._probability for p in pending]),device=device)
+    nm=torch.as_tensor(np.stack([p.next_memory for p in pending]),device=device,dtype=torch.long)
+    b,s,a,o=probs.shape;assert a==17
+    batch=torch.arange(b,device=device)[:,None,None]
+    goal=torch.tensor([p.goal for p in pending],device=device);gm=goal//o;go=goal%o
+    is_goal=nm[:,:,0]==gm[:,None]
+    stop=torch.where(is_goal,probs[:,:,0].gather(-1,go[:,None,None].expand(-1,s,1)).squeeze(-1),0.)
+    # Sum non-goal mass directly: no cancellation from subtracting near-one.
+    non_goal=torch.arange(o,device=device)[None,None,:]!=go[:,None,None]
+    stop_failure=torch.where(is_goal,(probs[:,:,0]*non_goal).sum(-1),1.)
+    levels=torch.zeros(horizon+1,b,s,device=device,dtype=torch.float64)
+    failures=torch.ones_like(levels);policies=torch.zeros(horizon+1,b,s,device=device,dtype=torch.int16)
+    rows=torch.arange(s,device=device)[None,:];bi=torch.arange(b,device=device)[:,None]
+    for h in range(1,horizon+1):
+        prev=levels[h-1].reshape(b,-1,o);pf=failures[h-1].reshape(b,-1,o)
+        q=(probs*prev[batch,nm]).sum(-1);f=(probs*pf[batch,nm]).sum(-1)
+        q[:,:,0]=stop;f[:,:,0]=stop_failure
+        action=torch.where(q.max(-1).values<=.5,q.argmax(-1),f.argmin(-1))
+        levels[h]=q[bi,rows,action].clamp(0,1)
+        failures[h]=f[bi,rows,action].clamp(0,1);policies[h]=action.to(torch.int16)
+    # One transfer of the compact derivation; CPU proof/audit stays unchanged.
+    lv=levels.cpu().numpy();fl=failures.cpu().numpy();po=policies.cpu().numpy()
+    for j,p in enumerate(pending):
+        p._levels=[lv[h,j].copy() for h in range(horizon+1)]
+        p._failures=[fl[h,j].copy() for h in range(horizon+1)]
+        p._policies=[po[h,j].copy() for h in range(horizon+1)]
+        p.gpu_planning_seconds=time.perf_counter()-began
+
+class Program(CPUProgram):
+    def extend(self,horizon):
+        if len(self._levels)<=horizon:extend_batch([self],horizon)
+
