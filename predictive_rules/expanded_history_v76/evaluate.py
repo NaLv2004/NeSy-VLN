@@ -45,7 +45,8 @@ def evaluate(model,manifest,out,rank=0,world_size=1,workers=12,history_predictor
     grounding_handle=model.memory.register_forward_pre_hook(reject_grounding_between_revisions)
     rows=[];sims=[];began=time.time()
     try:
-        sims=[bank.simulator(out/f'sim_rank{rank}_{i}.log',int(os.environ.get('LOCAL_RANK','0')),evaluation=True) for i in range(workers)]
+        with ThreadPoolExecutor(max_workers=min(8,workers)) as startup_pool:
+            sims=list(startup_pool.map(lambda i:bank.simulator(out/f'sim_rank{rank}_{i}.log',int(os.environ.get('LOCAL_RANK','0')),evaluation=True),range(workers)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for offset in range(0,len(episodes),workers):
                 batch=episodes[offset:offset+workers];n=len(batch)
@@ -113,9 +114,6 @@ def evaluate(model,manifest,out,rank=0,world_size=1,workers=12,history_predictor
                             proof['historical_discrete_evidence']=history_evidence
                         if not proof['found']:
                             records[i]['planning_failed']=True;records[i]['failed_proof']=proof;continue
-                        prepared.append((i,observed,observed_before_renewal,renew,probability))
-                    extend_batch([programs[i] for i in active],32-step,device)
-                    for i,observed,observed_before_renewal,renew,probability in prepared:
                         if history_predictor is None:audit(programs[i],proof)
                         else:audit_root(programs[i],proof)
                         action=int(proof['actions'][0])
@@ -125,6 +123,8 @@ def evaluate(model,manifest,out,rank=0,world_size=1,workers=12,history_predictor
                             predicted_memory=successor//c.observations,predicted_observation=successor%c.observations))
                         memories[i]=successor//c.observations;predicted_obs[i]=successor%c.observations;ages[i]+=1
                         requests.append((i,action))
+                    assert len(requests)<=len(active) and len({i for i,a in requests})==len(requests)
+                    atomic(out/f'rank{rank}.progress.json',dict(step=step,active=len(active),requests=len(requests),time=time.time()))
                     if not requests:break
                     responses=list(pool.map(lambda pair:sims[pair[0]].call('step',action=pair[1]),requests))
                     active=[]
