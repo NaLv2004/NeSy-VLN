@@ -1,0 +1,300 @@
+"""Proof-policy training states and all-action visual successor supervision.
+
+This is not evaluation and supplies no goal/action imitation labels. Immutable
+weights choose each action solely by the same discrete interpreter as dev80.
+Simulator probes and their features are stored after that choice, in a separate
+data path. The policy receives only the actually executed result at next step.
+"""
+import argparse
+import copy
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
+import json
+import os
+from pathlib import Path
+import random
+import select
+import subprocess
+import sys
+import time
+import traceback
+import numpy as np
+from PIL import Image
+import torch
+from torch.nn import functional as F
+from data import ROOT, sha
+from model import FactoredWorld, Config, hard
+from planner import Program, plan, audit
+from evaluate import atomic
+from predictive_nesy.environment import FrozenVision, make_bank
+from predictive_nesy.raw_boundary_vision import RawBoundaryGraphEncoder
+from predictive_nesy.gate import NeuralBoundaryGate
+
+
+class Probe:
+    def __init__(self, bank, folder):
+        sys.path.insert(0, '/home/user/xjy/objectnav_qwen35_rl_20260921/src_domain_sft_v1')
+        from objectnav_rl.ipc import send, receive
+        self.send, self.receive = send, receive
+        self.log = (folder / 'simulator.log').open('ab')
+        self.process = subprocess.Popen([bank.env['sim_python'], str(Path(__file__).with_name('closure_worker.py'))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
+            env=dict(os.environ, MAGNUM_LOG='quiet', HABITAT_SIM_LOG='quiet', OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2'))
+        self.call('init', experiment=bank.env, train_scenes=bank.provenance['train_layouts'])
+
+    def call(self, op, **kwargs):
+        self.send(self.process.stdin, dict(op=op, **kwargs))
+        if not select.select([self.process.stdout], [], [], 180)[0]:
+            raise TimeoutError(f'Collector worker {self.process.pid}: {op}')
+        response = self.receive(self.process.stdout)
+        if not response['ok']:
+            raise RuntimeError(response['error'])
+        return response['result']
+
+    def close(self):
+        if self.process.poll() is None:
+            self.call('close')
+            self.process.wait(timeout=15)
+        self.log.close()
+
+
+class Policy:
+    """Causal history, hard memory, rule renewal, and pure table derivation."""
+    def __init__(self, model, task, encoder, gate):
+        self.model, self.encoder, self.gate = model, encoder, gate
+        self.c = model.cfg
+        self.device = next(model.parameters()).device
+        self.task = torch.tensor([['chair', 'table'].index(task)], device=self.device)
+        self.features, self.observations, self.actions = [], [], []
+        self.programs, self.steps = [], []
+        self.program = None
+        self.context = None
+        self.grounding_allowed = False
+        self.memory = self.predicted_observation = self.age = None
+
+    @torch.no_grad()
+    def choose(self, rgb, defer_planning=False):
+        step = len(self.actions)
+        with self.gate.boundary(step):
+            _, raw = self.encoder.encode_joint([Image.fromarray(rgb)])
+            observed_global = int(self.model.observe(raw).argmax(-1))
+            observed = int(self.model.observe(raw,self.context).argmax(-1))
+            self.features.append(raw[0])
+            self.observations.append(observed_global)
+            renew, probability = step == 0, 1.
+            if step:
+                memory = F.one_hot(torch.tensor([self.memory], device=self.device), self.c.memories).float()
+                obs = F.one_hot(torch.tensor([observed], device=self.device), self.c.observations).float()
+                predicted = F.one_hot(torch.tensor([self.predicted_observation], device=self.device), self.c.observations).float()
+                probability = float(self.model.renewal_logits(memory, obs, predicted,
+                    torch.tensor([self.age], device=self.device)).sigmoid())
+                renew = self.age >= 5 and probability >= .5
+            if renew:
+                history = torch.stack(self.features)[None]
+                previous = torch.tensor([[17] + self.actions], device=self.device)
+                observations = F.one_hot(torch.tensor([self.observations], device=self.device), self.c.observations).float()
+                context = self.model.context_sequence(history, observations, previous, self.task)[:, -1]
+                self.context = context
+                local_logits,evidence,_ = self.model.observation_encoding(history,context)
+                observations = hard(local_logits)
+                observed = int(local_logits[0,-1].argmax(-1))
+                self.grounding_allowed = True
+                try:
+                    memory_logits, _, _ = self.model.memory_sequence(observations, previous,evidence)
+                finally:
+                    self.grounding_allowed = False
+                self.memory = int(memory_logits[0, -1].argmax(-1))
+                self.program = Program(**self.model.compile(context, self.task), observations=self.c.observations).validate()
+                self.age = 0
+                self.programs.append(dict(start=step, goal=self.program.goal, sha256=self.program.digest()))
+        prepared = (observed, renew, probability)
+        raw = raw[0].cpu().numpy()
+        if defer_planning:
+            return prepared, raw
+        return self.complete_choice(prepared, raw)
+
+    def complete_choice(self, prepared, raw):
+        # Pure NumPy rule-table planning; independent environments may run
+        # this method concurrently. It never touches a neural module or CUDA.
+        observed, renew, probability = prepared
+        step = len(self.actions)
+        proof = plan(self.program, self.memory, observed, horizon=32-step)
+        if not proof['found']:
+            self.failed_proof = proof
+            return None, raw
+        audit(self.program, proof)
+        action = int(proof['actions'][0])
+        self.steps.append(dict(step=step, observed=observed, memory=self.memory, action=action,
+            renewal_probability=probability, renewed=renew, proof=proof))
+        # The predicted hard memory is fixed BEFORE executing the action.
+        self.memory = int(proof['next_memory'])
+        self.predicted_observation = int(proof['predicted_observation'])
+        self.age += 1
+        return action, raw
+
+    def commit_execution(self, action):
+        assert action == self.steps[-1]['action']
+        self.actions.append(int(action))
+
+
+def selected_tasks(bank, count, seed):
+    rng = random.Random(seed)
+    groups = defaultdict(list)
+    for e in bank.train:
+        groups[(e['domain'], e['category'], e['distance_group'])].append(e)
+    assert count % len(groups) == 0
+    quota = count // len(groups)
+    tasks = []
+    for key in sorted(groups):
+        values = sorted(groups[key], key=lambda e: e['episode_id'])
+        assert len(values) >= quota
+        tasks.extend(rng.sample(values, quota))
+    rng.shuffle(tasks)
+    return tasks
+
+
+@torch.no_grad()
+def main():
+    parser=argparse.ArgumentParser();parser.add_argument('--out',required=True)
+    parser.add_argument('--checkpoint',required=True);parser.add_argument('--rank',type=int,required=True)
+    parser.add_argument('--tasks',type=int,default=600);parser.add_argument('--workers',type=int,default=24)
+    args=parser.parse_args();assert args.rank in (0,1) and os.environ['CUDA_VISIBLE_DEVICES']==str(6+args.rank)
+    assert 1<=args.workers<=24
+    torch.set_num_threads(2);torch.backends.cuda.matmul.allow_tf32=True;torch.backends.cudnn.allow_tf32=True
+    out=Path(args.out).resolve();assert out.parent==ROOT and out.name=='counterfactual_closure_v63'
+    out.mkdir(exist_ok=True);lock=(out/f'rank{args.rank}.lock').open('a')
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    checkpoint=Path(args.checkpoint);commit=json.loads(checkpoint.with_suffix('.COMMITTED.json').read_text())
+    assert sha(checkpoint)==commit['sha256']
+    saved=torch.load(checkpoint,map_location='cpu',weights_only=False)
+    model=FactoredWorld(Config(**saved['model_config'])).cuda().eval().requires_grad_(False)
+    model.load_state_dict(saved['model'],strict=True);manifest=saved['manifest'];del saved
+    # A distinct frozen copy supplies OFFLINE target labels. It never writes
+    # memory into a Policy instance, nor participates in runtime planning.
+    target_memory=copy.deepcopy(model.memory);target_reconstruct=copy.deepcopy(model.memory_reconstruct)
+    target_definitions=F.normalize(model.memory_definitions.detach().clone(),dim=-1)
+    def label_memory(m,o,a,z):
+        one=F.one_hot(m,32).float();hidden=target_reconstruct(one)
+        x=torch.cat([F.one_hot(o,64).float(),F.one_hot(a,18).float(),z],-1)
+        h=target_memory(x.flatten(0,-2),hidden.flatten(0,-2)).reshape(*m.shape,128)
+        return (12*F.normalize(h,dim=-1)@target_definitions.T).argmax(-1)
+    bank=make_bank();tasks=selected_tasks(bank,args.tasks,631017)
+    assert set(manifest['data']['train_layouts'])==set(bank.provenance['train_layouts'])
+    assert not {e['scene'] for e in tasks}&{e['scene'] for e in bank.dev}
+    provenance=dict(training_only=True,source_commit=commit,source_checkpoint=str(checkpoint),
+        episode_ids=[e['episode_id'] for e in tasks],train_layouts=bank.provenance['train_layouts'],
+        split_provenance=bank.provenance,max_actions=32,world_size=2,seed=631017,
+        policy='v60 best1000; every real action derived by unchanged categorical rules',
+        label_basis='Frozen source perception, context, generated definitions and memory grounding encoder',
+        data_fields=['context','memory','observation','first_observation','first_memory','second_actions','second_observation','second_memory','second_valid','recorded_actions'],
+        first_actions=17,second_actions_per_nonterminal_first=2,second_stop_parent_masked=True,
+        no_map=True,privileged_state_labels=False,goal_labels=False,probes_available_to_policy=False,
+        intended_training='Categorical one-step and two-step successor likelihood with frozen source abstraction; not compatible with untracked encoder changes')
+    provenance['successor_encoding'] = dict(current='batched_51_bfloat16',
+        previous_completed_episodes='canonical_single_image', weights_unchanged=True,
+        observed_probe_observation_changes='0/153', observed_probe_memory_changes='1/153',
+        user_accepted_small_numerical_label_changes=True)
+    if (out/'manifest.json').exists():
+        old=json.loads((out/'manifest.json').read_text());assert old['source_commit']==commit and old['episode_ids']==provenance['episode_ids']
+    if args.rank==0:atomic(out/'manifest.json',provenance)
+    tasks=tasks[args.rank::2];folder=out/'episodes';folder.mkdir(exist_ok=True)
+    done=positions=executed=0;todo=[]
+    for e in tasks:
+        p=folder/(e['episode_id']+'.npz')
+        if p.exists() and p.with_suffix('.json').exists():
+            r=json.loads(p.with_suffix('.json').read_text());assert sha(p)==r['sha256'] and r['source_sha256']==commit['sha256']
+            done+=1;positions+=r['positions'];executed+=r['executed_actions']
+        else:todo.append(e)
+    frontend=FrozenVision(manifest['frozen_vision']);gate=NeuralBoundaryGate([model,frontend.vision],interval=1)
+    encoder=RawBoundaryGraphEncoder(frontend,gate);active_policy=[None]
+    from batch_future import BatchFutureEncoder
+    future_encoder=BatchFutureEncoder(frontend,gate,batch_size=51)
+    handle=model.inverse.register_forward_pre_hook(lambda *_:(_ for _ in ()).throw(RuntimeError('Inverse action fallback forbidden')))
+    def memory_guard(*_):
+        assert active_policy[0] is not None and active_policy[0].grounding_allowed,'Runtime memory correction forbidden'
+    mh=model.memory.register_forward_pre_hook(memory_guard)
+    sims=[];began=time.time();initial_done=done
+    phases=defaultdict(float)
+    status=dict(state='starting',pid=os.getpid(),completed=done,total=len(tasks),positions=positions,executed_actions=executed,time=began,
+        workers=args.workers,initial_completed=initial_done,optimization='parallel_numpy_plans_24_simulators_per_gpu_batched_future51')
+    atomic(out/f'status_rank{args.rank}.json',status)
+    try:
+        for i in range(args.workers):
+            w=out/f'worker_{args.rank}_{i}';w.mkdir(exist_ok=True);sims.append(Probe(bank,w))
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for offset in range(0,len(todo),args.workers):
+                batch=todo[offset:offset+args.workers]
+                reset=list(pool.map(lambda pair:pair[0].call('reset',episode=pair[1],verify_pairs=[(1,2),(5,16)] if offset==0 else []),zip(sims,batch)))
+                rgb=[r['rgb'] for r in reset];policies=[Policy(model,e['category'],encoder,gate) for e in batch]
+                randoms=[np.random.default_rng(int.from_bytes(e['episode_id'].encode(),'little')%(2**63)) for e in batch]
+                buffers=[defaultdict(list) for _ in batch];active=list(range(len(batch)));endings=['budget']*len(batch)
+                for step in range(32):
+                    requests={}
+                    prepared={};t=time.perf_counter()
+                    for i in active:
+                        policy=policies[i];active_policy[0]=policy
+                        prepared[i]=policy.choose(rgb[i],defer_planning=True);active_policy[0]=None
+                    phases['neural_preparation']+=time.perf_counter()-t;t=time.perf_counter()
+                    choices=dict(pool.map(lambda i:(i,policies[i].complete_choice(*prepared[i])),active))
+                    phases['symbolic_planning']+=time.perf_counter()-t
+                    for i in active:
+                        policy=policies[i];action,raw=choices[i]
+                        state=policy.steps[-1] if action is not None else policy.failed_proof
+                        current_m=int(state['memory']);current_o=int(state['observed'])
+                        second=np.stack([randoms[i].choice(17,size=2,replace=False) for _ in range(17)])
+                        b=buffers[i];b['context'].append(policy.context[0].cpu().numpy().copy())
+                        b['memory'].append(current_m);b['observation'].append(current_o);b['second_actions'].append(second)
+                        op='probe_only' if action is None else 'probe_and_execute'
+                        if action is None:endings[i]='no_proof'
+                        requests[i]=(action,pool.submit(sims[i].call,op,action=action,second_actions=second))
+                    next_active=[]
+                    for i,(action,request) in requests.items():
+                        t=time.perf_counter();response=request.result();phases['simulation_wait']+=time.perf_counter()-t
+                        assert np.array_equal(response['current'],rgb[i]);t=time.perf_counter()
+                        images=np.concatenate([response['successors'],response['second_successors'].reshape(34,224,224,3)])
+                        policy=policies[i];b=buffers[i]
+                        with gate.boundary(step):
+                            raw=future_encoder.encode([Image.fromarray(x) for x in images])
+                            lo,z,_=model.observation_encoding(raw[None],policy.context)
+                        obs=lo[0].argmax(-1);z=z[0];a=torch.arange(17,device='cuda')
+                        m=torch.full((17,),b['memory'][-1],device='cuda',dtype=torch.long)
+                        first_m=label_memory(m,obs[:17],a,z[:17])
+                        second_a=torch.tensor(b['second_actions'][-1],device='cuda').long()
+                        second_m=label_memory(first_m[:,None].expand(-1,2),obs[17:].reshape(17,2),second_a,z[17:].reshape(17,2,128))
+                        b['first_observation'].append(obs[:17].cpu().numpy());b['first_memory'].append(first_m.cpu().numpy())
+                        b['second_observation'].append(obs[17:].reshape(17,2).cpu().numpy());b['second_memory'].append(second_m.cpu().numpy())
+                        b['second_valid'].append(response['second_valid'])
+                        phases['batched_successor_encoding']+=time.perf_counter()-t
+                        if action is not None:
+                            assert response['probe_matches_execution'],response['probe_rgb_error']
+                            policy.commit_execution(action);rgb[i]=response['actual']
+                            if response['done']:endings[i]='environment_done'
+                            else:next_active.append(i)
+                    active=next_active
+                    if not active:break
+                for i,e in enumerate(batch):
+                    p=folder/(e['episode_id']+'.npz');tmp=p.with_suffix('.tmp.npz');b=buffers[i]
+                    arrays={k:np.asarray(v,dtype=np.float32 if k=='context' else np.bool_ if k=='second_valid' else np.int16) for k,v in b.items()}
+                    arrays['recorded_actions']=np.asarray(policies[i].actions,dtype=np.int16)
+                    assert np.isfinite(arrays['context']).all()
+                    np.savez_compressed(tmp,**arrays);tmp.replace(p)
+                    r=dict(episode=e['episode_id'],scene=e['scene'],domain=e['domain'],category=e['category'],distance_group=e['distance_group'],
+                        training_only=True,source_sha256=commit['sha256'],sha256=sha(p),positions=len(b['memory']),
+                        executed_actions=len(policies[i].actions),termination=endings[i],programs=policies[i].programs,steps=policies[i].steps,
+                        failed_proof=getattr(policies[i],'failed_proof',None),two_step_probe_execution_errors=reset[i]['two_step_checks'],
+                        offline_future_labels_never_assigned_to_policy=True,
+                        successor_encoding='batched_51_bfloat16', policy_encoding='canonical_single_image')
+                    atomic(p.with_suffix('.json'),r);done+=1;positions+=r['positions'];executed+=r['executed_actions']
+                status.update(state='collecting',completed=done,positions=positions,executed_actions=executed,time=time.time(),seconds=time.time()-began,
+                    one_step_outcomes=positions*17,two_step_outcomes=positions*32,gpu_peak_gib=torch.cuda.max_memory_allocated()/2**30,
+                    completed_since_restart=done-initial_done,phase_seconds=dict(phases))
+                atomic(out/f'status_rank{args.rank}.json',status);print(json.dumps(status),flush=True)
+        atomic(out/f'status_rank{args.rank}.json',dict(status,state='complete',time=time.time()))
+    except Exception as e:
+        atomic(out/f'status_rank{args.rank}.json',dict(status,state='failed',time=time.time(),error=repr(e),traceback=traceback.format_exc()));raise
+    finally:
+        mh.remove();handle.remove();gate.close()
+        for sim in sims:sim.close()
+
+if __name__=='__main__':main()
