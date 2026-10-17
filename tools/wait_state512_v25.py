@@ -1,0 +1,18 @@
+"""Kernel process-exit wait; no repeated GPU or training-log polling."""
+import json,os,select,subprocess,time
+from pathlib import Path
+root=Path('/home/user/xjy/nesy_vla_20261010/predictive_rules_20261015');run=root/'run_state512_v25'
+launcher=json.loads((run/'launcher.json').read_text());pid=launcher['pid'];proc=Path('/proc')/str(pid)
+if proc.exists():
+    command=(proc/'cmdline').read_bytes().decode().replace('\0',' ')
+    assert 'train_state512_v25.py' in command and str(run) in command
+    fd=os.pidfd_open(pid);began=time.monotonic()
+    try:
+        while not select.select([fd],[],[],50)[0]:
+            print(json.dumps(dict(waiting_for_existing_training_exit=True,pid=pid)),flush=True)
+            if time.monotonic()-began>3600:raise TimeoutError('Existing training remains live; reobserve this handle instead of relaunching')
+    finally:os.close(fd)
+result=json.loads(subprocess.check_output(['python3',str(root/'diagnostics/check_predictive_training.py'),'--run',run.name],text=True))
+target=root/'diagnostics/state512_v25_completed.json';assert not target.exists();target.write_text(json.dumps(result,indent=2))
+print(json.dumps(dict(status=result['status'],process_alive=result['process_alive'],committed_hash_verified=result['committed_hash_verified'],
+    validation=[dict(update=x['update'],successes=x['successes'],episodes=x['episodes']) for x in result['validation']])),flush=True)

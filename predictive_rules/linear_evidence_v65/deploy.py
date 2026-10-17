@@ -1,0 +1,17 @@
+import json,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'tools'))
+from predictive_remote import connect
+source=Path(__file__).parent
+remote='/home/user/xjy/nesy_vla_20261010/predictive_rules_20261015/src_linear_evidence_v65'
+client=connect()
+try:
+    _,out,err=client.exec_command('mkdir -p '+remote)
+    assert out.channel.recv_exit_status()==0,err.read().decode()
+    with client.open_sftp() as ftp:
+        for path in sorted(source.glob('*.py')):
+            if path.name!='deploy.py':ftp.put(str(path),remote+'/'+path.name)
+    _,out,err=client.exec_command('python3 '+remote+'/launch_remote.py',timeout=30)
+    result=out.read().decode();error=err.read().decode();assert out.channel.recv_exit_status()==0,error
+    record=json.loads(result);(source/'launch.json').write_text(json.dumps(record,indent=2));print(json.dumps(record))
+finally:client.close()

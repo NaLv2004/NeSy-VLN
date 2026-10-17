@@ -1,0 +1,16 @@
+from pathlib import Path
+root=Path(__file__).resolve().parents[1]/'predictive_rules'
+text=(root/'train_graph_subgoal.py').read_text()
+text=text.replace("'anonymous_graph_subgoal_v3'","'anonymous_graph_subgoal_v4'")
+text=text.replace("and not name.startswith('subgoal.') and", "and (old.get('architecture','').startswith('anonymous_graph_subgoal_') or not name.startswith('subgoal.')) and")
+text=text.replace('proof_action_supervision=True,learned_joint_state_count=128,','proof_action_supervision=True,learned_joint_state_count=128,\n        training_uses_exact_argmax_transitions=True,')
+(root/'train_graph_subgoal.py').write_text(text)
+text=(root/'evaluate_graph_subgoal.py').read_text().replace("'anonymous_graph_subgoal_v3'","'anonymous_graph_subgoal_v4'")
+(root/'evaluate_graph_subgoal.py').write_text(text)
+text=(root/'start_graph_subgoal.py').read_text().replace('src_graph_subgoal_v3','src_graph_subgoal_v4').replace('run_graph_subgoal_v3','run_graph_subgoal_v4')
+text=text.replace("root/'run_anonymous_v5/best_development.pt'","root/'run_graph_subgoal_v3/checkpoint_000400.pt'")
+(root/'start_graph_subgoal.py').write_text(text)
+text=(root/'diagnose_graph_plan_alignment.py').read_text().replace('import reachability','import proof_log_support')
+text=text.replace('reachability(prog,goal,10)[10]','proof_log_support(prog,goal,10)[10]')
+text=text.replace('relaxed_first_action_accuracy','training_first_action_accuracy').replace('relaxed_exact_agreement','training_execution_agreement')
+(root/'diagnose_graph_exact_alignment.py').write_text(text)

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NeSy 训练控制面板</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<header><div class="brand">N<span>↗</span></div><div><div class="eyebrow">NEURAL SYMBOLIC NAVIGATION</div><h1>NeSy 训练控制面板</h1></div><div class="header-right"><span id="connection" class="status">正在连接</span><div id="updated" class="muted">等待远端日志</div></div></header>
+<main>
+<section class="panel" id="factored-panel" hidden>
+<div class="section-title"><h2 id="factored-title">当前训练：离散观测与记忆联合规则模型</h2><span id="factored-state" class="pill"></span></div>
+<p id="factored-status"></p>
+<p class="note">当前为状态表示、动作转移和子目标的联合监督训练。两个离散编号共同参与符号推导。每 500 次更新在原有完整 80 任务开发集评估，最多执行 32 个动作。</p>
+<div class="grid two">
+<div><h3>联合训练损失</h3><div id="factored-loss-legend" class="legend"></div><div class="chart"><canvas id="factored-loss"></canvas></div></div>
+<div><h3>观测编号预测准确率</h3><div id="factored-accuracy-legend" class="legend"></div><div class="chart"><canvas id="factored-accuracy"></canvas></div></div>
+<div><h3>固定开发集导航成功率</h3><div id="factored-dev-legend" class="legend"></div><div class="chart"><canvas id="factored-dev"></canvas></div></div>
+<div><h3>离散表示的使用情况</h3><div id="factored-codes-legend" class="legend"></div><div class="chart"><canvas id="factored-codes"></canvas></div></div>
+</div>
+<p class="note">训练准确率只表示对真实后继画面的编号预测；导航能力以固定开发集闭环成功率为准。下方保留已暂停 v35 PPO 的历史记录。</p>
+</section>
+<section class="toolbar"><div><b id="run-label">匿名离散状态与符号规划</b><div class="muted" id="run-details">GPU 6、7。每次更新采样 128 条轨迹。</div></div><div class="window"><label for="window">最近 <input id="window" type="number" min="1" max="20000" step="128" value="1024"> 次尝试</label><select id="preset" aria-label="窗口预设"><option value="128">128 次</option><option value="512">512 次</option><option value="1024" selected>1024 次</option><option value="4096">4096 次</option><option value="20000">20000 次</option></select><button id="apply">应用窗口</button><button id="refresh" class="secondary">刷新</button></div></section>
+<div id="alert" class="alert" hidden></div>
+<section class="cards">
+<article><div class="label">已完成 PPO 更新</div><div class="big" id="updates">—</div><div class="sub" id="total-attempts">等待采样记录</div></article>
+<article><div class="label">最近 K 次尝试成功率</div><div class="big teal" id="train-rate">—</div><div class="sub" id="train-count">按轨迹计数</div></article>
+<article><div class="label">最新固定开发集成功率</div><div class="big" id="dev-rate">—</div><div class="sub" id="dev-count">每 10 次更新评估 80 个任务</div></article>
+<article><div class="label">最近 10 次更新平均耗时</div><div class="big" id="speed">—</div><div class="sub" id="throughput">包含采样与优化</div></article>
+<article><div class="label">训练单步状态预测准确率</div><div class="big" id="transition-rate">—</div><div class="sub" id="transition-count">读取已有轨迹计算</div></article>
+<article><div class="label">每套规则平均执行动作数</div><div class="big" id="program-steps">—</div><div class="sub" id="program-count">包含初次生成的规则</div></article>
+</section>
+<section class="panel live-panel"><div class="section-title"><h2>实时运行</h2><span id="commit" class="muted"></span></div><div class="live-grid"><div id="workers"></div><div id="gpus"></div></div></section>
+<div class="section-heading"><h2>模型能力</h2><span id="window-note" class="muted"></span></div>
+<div class="grid two">
+<section class="panel"><div class="section-title"><h3>成功率随更新的变化</h3><span class="pill">训练与固定评估分开统计</span></div><div id="success-legend" class="legend"></div><div class="chart"><canvas id="success"></canvas></div><p class="note">训练采用随机规则采样；开发集采用确定性规则均值。虚线为 PPO 开始前的 SFT 开发集结果。</p></section>
+<section class="panel"><div class="section-title"><h3>按任务难度的成功率</h3><span class="pill">最近 K 次尝试</span></div><div id="difficulty-legend" class="legend"></div><div class="chart"><canvas id="difficulty"></canvas></div><p class="note">每条曲线分别统计窗口内的短、中、长距离任务。样本数显示在下表中。</p></section>
+</div>
+<div class="grid split">
+<section class="panel"><div class="section-title"><h3>各类任务表现</h3><span class="muted">同一窗口，分别计数</span></div><table><thead><tr><th>任务类别</th><th>成功 / 尝试</th><th>成功率</th><th>碰撞动作率</th><th>状态预测</th></tr></thead><tbody id="groups"></tbody></table></section>
+<section class="panel"><div class="section-title"><h3>轨迹结束原因</h3></div><div id="reasons" class="bars"></div><p class="note">“无可用符号计划”表示当前规则未找到到达生成子目标的路径。碰撞动作率按动作次数统计。</p></section>
+</div>
+<div class="grid two">
+<section class="panel"><div class="section-title"><h3>状态转移预测准确率</h3><span class="pill">预测后，观测校正前</span></div><div id="transition-legend" class="legend"></div><div class="chart"><canvas id="transition"></canvas></div><p class="note" id="transition-note">比较 T(当前符号状态, 已执行动作) 与下一帧编码出的状态编号。只统计同一套定义下可以配对的相邻帧。</p></section>
+<section class="panel"><div class="section-title"><h3>采样回报与失败行为</h3><select id="behavior-metric"><option value="mean_return">平均轨迹回报</option><option value="collision_rate">碰撞动作率</option><option value="steps_per_program">每套规则执行动作数</option></select></div><div id="behavior-legend" class="legend"></div><div class="chart"><canvas id="behavior"></canvas></div><p class="note">回报上升需要结合成功率判断。规则执行动作数的统计包括初次生成与每次更新。</p></section>
+</div>
+<div class="section-heading"><h2>PPO 健康程度</h2><span class="muted">显示最后一次更新及历史走势</span></div>
+<div id="health-cards" class="health-cards"></div>
+<div class="grid two">
+<section class="panel"><div class="section-title"><h3>策略更新幅度</h3><select id="policy-metric"><option value="program_kl">平均联合 KL</option><option value="program_max_kl">单个程序最大 KL</option><option value="clip_fraction">概率比裁剪占比</option><option value="program_context_rms_change">程序条件向量 RMS 变化</option></select></div><div id="policy-legend" class="legend"></div><div class="chart"><canvas id="policy"></canvas></div><p class="note">KL 按完整的 256 维程序条件分布计算。当前代码在平均 KL 超过 0.05 时结束本轮优化，候选更新超过 0.10 时回滚。</p></section>
+<section class="panel"><div class="section-title"><h3>优化损失与梯度</h3><select id="loss-metric"><option value="ppo_loss">PPO 策略损失</option><option value="critic_loss">价值网络损失</option><option value="actor_gradient_norm">裁剪前策略梯度范数</option><option value="advantage_std">未标准化优势的标准差</option><option value="likelihood_replay_max_error">旧策略概率重算最大误差</option><option value="actor_lr">策略学习率</option></select></div><div id="loss-legend" class="legend"></div><div class="chart"><canvas id="loss"></canvas></div><p class="note">PPO 损失的正负及大小不能单独说明导航能力。应同时看成功率、KL、裁剪占比与实际接受的更新数。</p></section>
+<section class="panel"><div class="section-title"><h3>更新耗时</h3><span class="pill">秒</span></div><div id="timing-legend" class="legend"></div><div class="chart small"><canvas id="timing"></canvas></div><p class="note">双卡采样与优化分别取最慢卡耗时，因此分项之和可能略大于单次更新总耗时。固定开发集评估时间单列。</p></section>
+<section class="panel"><div class="section-title"><h3>优化器更新是否被接受</h3></div><div id="accepted-legend" class="legend"></div><div class="chart small"><canvas id="accepted"></canvas></div><p class="note">一次 PPO 更新最多进行 4 次策略优化。被拒绝的候选更新会恢复参数和优化器状态，并减半学习率。</p></section>
+</div>
+<section class="panel"><div class="section-title"><h3>固定开发集评估记录</h3><span class="muted">保留 80 个任务的既有划分</span></div><div class="table-scroll"><table><thead><tr><th>模型</th><th>成功 / 总数</th><th>短距离</th><th>中距离</th><th>长距离</th><th>普通布局</th><th>密集障碍</th><th>碰撞动作率</th><th>动作 / 规则</th><th>状态预测</th><th>评估耗时</th></tr></thead><tbody id="development"></tbody></table></div></section>
+<details class="panel"><summary>统计口径与数据来源</summary><div class="definitions"><p>一个“尝试”是一条完整采样轨迹。任务有放回抽取，每次抽中执行一条轨迹；每卡 64 条，双卡共 128 条。K 是轨迹数量，可设为 1–20000。窗口按 PPO 更新编号、卡编号和批内序号排序；同批并行轨迹不代表真实完成时间先后。重复抽中的任务按不同尝试计数。</p><p>状态准确率衡量已学习的匿名离散编码是否可被规则预测，不等同于物理场景真值准确率。统计的是执行前规则给出的下一状态，与下一帧在同一套谓词定义下提取的编号完全相等的比例。规则更新边界、最终停止帧和没有后续记录的帧不参与比较；覆盖率单独显示。观测校正后的状态不会充当预测结果。</p><p>训练与开发集指标来自远端已保存的日志与轨迹。页面每 5 秒同步日志，每 30 秒更新显卡状态；共享一条 SSH 长连接，断线自动重连。训练和数据划分不因页面刷新改变，也不会启动额外导航评估。GPU 0–5 的其他任务不在本页面监控范围内。</p><p id="source-path"></p></div></details>
+<footer><span>NeSy PPO v35</span><span id="footer-time"></span></footer>
+</main><div id="tooltip" class="tooltip" hidden></div><script src="/app.js"></script></body></html>
