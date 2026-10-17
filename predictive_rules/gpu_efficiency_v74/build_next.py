@@ -46,7 +46,7 @@ assert marker in s
 s=s.replace(marker,"""                        prepared.append((i,observed,observed_before_renewal,renew,probability))
                     extend_batch([programs[i] for i in active],32-step,device)
                     for i,observed,observed_before_renewal,renew,probability in prepared:
-"""+marker)
+"""+marker,1)
 write(f/'evaluate.py',s)
 s=(f/'supervisor.py').read_text().replace('compact_history_v73',names[1]);write(f/'supervisor.py',s)
 
